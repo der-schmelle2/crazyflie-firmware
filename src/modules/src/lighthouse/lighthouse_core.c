@@ -41,6 +41,7 @@
 #define DEBUG_MODULE "LH"
 #include "debug.h"
 #include "uart1.h"
+#include "crtp_localization_service.h"
 
 #include "pulse_processor.h"
 #include "pulse_processor_v1.h"
@@ -49,6 +50,8 @@
 #include "lighthouse_deck_flasher.h"
 #include "lighthouse_position_est.h"
 #include "lighthouse_core.h"
+
+#include "storage.h"
 
 #include "test_support.h"
 #include "static_mem.h"
@@ -73,7 +76,7 @@ static STATS_CNT_RATE_DEFINE(bs1Rate, HALF_SECOND);
 static statsCntRateLogger_t* bsRates[PULSE_PROCESSOR_N_BASE_STATIONS] = {&bs0Rate, &bs1Rate};
 
 static uint16_t pulseWidth[PULSE_PROCESSOR_N_SENSORS];
-NO_DMA_CCM_SAFE_ZERO_INIT pulseProcessor_t lighthouseCoreState = {
+pulseProcessor_t lighthouseCoreState = {
   .bsGeometry = {
     // Arena LH1
     // {.valid = true, .origin = {-1.958483,  0.542299,  3.152727, }, .mat = {{0.79721498, -0.004274, 0.60368103, }, {0.0, 0.99997503, 0.00708, }, {-0.60369599, -0.005645, 0.79719502, }, }},
@@ -112,6 +115,21 @@ pulseProcessorProcessPulse_t pulseProcessorProcessPulse = (void*)0;
 #endif
 
 #define UART_FRAME_LENGTH 12
+
+
+// Persistent storage
+#define STORAGE_VERSION_KEY "lh/ver"
+#define CURRENT_STORAGE_VERSION "1"
+#define STORAGE_KEY_GEO "lh/sys/0/geo/"
+#define STORAGE_KEY_CALIB "lh/sys/0/cal/"
+#define KEY_LEN 20
+
+static void verifySetStorageVersion();
+static baseStationGeometry_t geoBuffer;
+TESTABLE_STATIC void initializeGeoDataFromStorage();
+static lighthouseCalibration_t calibBuffer;
+TESTABLE_STATIC void initializeCalibDataFromStorage();
+
 
 void lighthouseCoreInit() {
   lighthousePositionEstInit();
@@ -226,6 +244,9 @@ static void usePulseResult(pulseProcessor_t *appState, pulseProcessorResult_t* a
       convertV2AnglesToV1Angles(angles);
     }
 
+    // Send measurement to the ground
+    locSrvSendLighthouseAngle(basestation, angles);
+
     switch(estimationMethod) {
       case 0:
         usePulseResultCrossingBeams(appState, angles, basestation);
@@ -334,6 +355,10 @@ void lighthouseCoreTask(void *param) {
   uart1Init(230400);
   systemWaitStart();
 
+  verifySetStorageVersion();
+  initializeGeoDataFromStorage();
+  initializeCalibDataFromStorage();
+
   lighthouseDeckFlasherCheckVersionAndBoot();
 
   memset(&bsIdentificationData, 0, sizeof(bsIdentificationData));
@@ -372,6 +397,76 @@ void lighthouseCoreTask(void *param) {
 void lighthouseCoreSetCalibrationData(const uint8_t baseStation, const lighthouseCalibration_t* calibration) {
   if (baseStation < PULSE_PROCESSOR_N_BASE_STATIONS) {
     lighthouseCoreState.bsCalibration[baseStation] = *calibration;
+  }
+}
+
+static void generateStorageKey(char* buf, const char* base, const uint8_t baseStation) {
+  // TOOD make an implementation that supports baseStations with 2 digits
+  ASSERT(baseStation <= 9);
+
+  const int baseLen = strlen(base);
+  memcpy(buf, base, baseLen);
+  buf[baseLen] = '0' + baseStation;
+  buf[baseLen + 1] = '\0';
+}
+
+bool lighthouseCorePersistData(const uint8_t baseStation, const bool geoData, const bool calibData) {
+  bool result = true;
+  char key[KEY_LEN];
+
+  if (baseStation < PULSE_PROCESSOR_N_BASE_STATIONS) {
+    if (geoData) {
+      generateStorageKey(key, STORAGE_KEY_GEO, baseStation);
+      result = result && storageStore(key, &lighthouseCoreState.bsGeometry[baseStation], sizeof(lighthouseCoreState.bsGeometry[baseStation]));
+    }
+    if (calibData) {
+      generateStorageKey(key, STORAGE_KEY_CALIB, baseStation);
+      result = result && storageStore(key, &lighthouseCoreState.bsCalibration[baseStation], sizeof(lighthouseCoreState.bsCalibration[baseStation]));
+    }
+  }
+
+  return result;
+}
+
+static void verifySetStorageVersion() {
+  const int bufLen = 5;
+  char buffer[bufLen];
+
+  const size_t fetched = storageFetch(STORAGE_VERSION_KEY, buffer, bufLen);
+  if (fetched == 0) {
+    storageStore(STORAGE_VERSION_KEY, CURRENT_STORAGE_VERSION, strlen(CURRENT_STORAGE_VERSION) + 1);
+  } else {
+    if (strcmp(buffer, CURRENT_STORAGE_VERSION) != 0) {
+      // The storage format version is wrong! What to do?
+      // No need to handle until we bump the storage version, assert for now.
+      ASSERT_FAILED();
+    }
+  }
+}
+
+TESTABLE_STATIC void initializeGeoDataFromStorage() {
+  char key[KEY_LEN];
+
+  for (int baseStation = 0; baseStation < PULSE_PROCESSOR_N_BASE_STATIONS; baseStation++) {
+    generateStorageKey(key, STORAGE_KEY_GEO, baseStation);
+    const size_t geoSize = sizeof(geoBuffer);
+    const size_t fetched = storageFetch(key, (void*)&geoBuffer, geoSize);
+    if (fetched == geoSize) {
+      lighthousePositionSetGeometryData(baseStation, &geoBuffer);
+    }
+  }
+}
+
+TESTABLE_STATIC void initializeCalibDataFromStorage() {
+  char key[KEY_LEN];
+
+  for (int baseStation = 0; baseStation < PULSE_PROCESSOR_N_BASE_STATIONS; baseStation++) {
+    generateStorageKey(key, STORAGE_KEY_CALIB, baseStation);
+    const size_t calibSize = sizeof(calibBuffer);
+    const size_t fetched = storageFetch(key, (void*)&calibBuffer, calibSize);
+    if (fetched == calibSize) {
+      lighthouseCoreSetCalibrationData(baseStation, &calibBuffer);
+    }
   }
 }
 
